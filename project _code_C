@@ -1,0 +1,495 @@
+[12/10, 11:04 am] +91 63853 98950: #include <Wire.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <math.h>
+
+// MOTOR DRIVER
+#define IN1 26
+#define IN2 27
+
+// GREEN LED
+#define GREEN_LED 32
+
+// DS18B20
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
+
+// MPU6500
+#define MPU_ADDR 0x68
+
+// LORA SX1278
+#define LORA_SS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+// TIMING
+const unsigned long SEND_INTERVAL = 1000;
+unsigned long lastSend = 0;
+
+// SENSOR DATA
+float temperatureC = NAN;
+float vibrationG = -1.0;
+
+// INITIALIZE MPU6500
+bool initMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+
+  if (Wire.endTransmission() != 0) return false;
+
+  delay(100);
+
+  // Accelerometer range +/- 8g
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x10);
+
+  if (Wire.endTransmission() != 0) return false;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75);
+
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, 1) != 1) return false;
+
+  byte id = Wire.read();
+
+  Serial.print("MPU WHO_AM_I: 0x");
+  Serial.println(id, HEX);
+
+  return (id == 0x70 || id == 0x71 || id == 0x68);
+}
+
+// READ VIBRATION
+float readVibration() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) return -1.0;
+  if (Wire.requestFrom(MPU_ADDR, 6) != 6) return -1.0;
+
+  int16_t ax = (Wire.read() << 8) | Wire.read();
+  int16_t ay = (Wire.read() << 8) | Wire.read();
+  int16_t az = (Wire.read() << 8) | Wire.read();
+
+  float xg = ax / 4096.0;
+  float yg = ay / 4096.0;
+  float zg = az / 4096.0;
+
+  float totalG = sqrt(xg * xg + yg * yg + zg * zg);
+
+  // Simple acceleration deviation estimate
+  return fabs(totalG - 1.0);
+}
+
+// SEND DATA THROUGH LORA
+void sendData() {
+  char packet[64];
+
+  snprintf(packet, sizeof(packet),
+           "TEMP:%.2f,VIB:%.2f",
+           temperatureC, vibrationG);
+
+  Serial.print("Sending: ");
+  Serial.println(packet);
+
+  LoRa.beginPacket();
+  LoRa.print(packet);
+
+  int result = LoRa.endPacket();
+
+  if (result == 1) {
+    Serial.println("LoRa transmission completed");
+  } else {
+    Serial.println("LoRa transmission failed");
+  }
+
+  Serial.println("-------------------------");
+}
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("PREDICTIVE MAINTENANCE");
+  Serial.println("ESP32 TRANSMITTER");
+
+  // Motor driver
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+
+  // Green LED continuously ON
+  pinMode(GREEN_LED, OUTPUT);
+  digitalWrite(GREEN_LED, HIGH);
+
+  // Temperature sensor
+  tempSensor.begin();
+
+  // I2C
+  Wire.begin(21, 22);
+
+  if (initMPU()) {
+    Serial.println("MPU6500 OK");
+  } else {
+    Serial.println("MPU6500 ERROR - Check wiring/address");
+  }
+
+  // LoRa initialization
+  SPI.begin(18, 19, 23, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa initialization FAILED");
+
+    while (true) {
+      digitalWrite(GREEN_LED, HIGH);
+      delay(500);
+    }
+  }
+
+  // Must match receiver settings
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
+  LoRa.setTxPower(17);
+
+  Serial.println("LoRa transmitter ready");
+  Serial.println("GREEN LED GPIO32 = ON");
+}
+
+// MAIN LOOP
+void loop() {
+  // Keep Green LED ON
+  digitalWrite(GREEN_LED, HIGH);
+
+  // Read temperature
+  tempSensor.requestTemperatures();
+  float t = tempSensor.getTempCByIndex(0);
+
+  if (t != DEVICE_DISCONNECTED_C && t >= -50 && t <= 125) {
+    temperatureC = t;
+  } else {
+    Serial.println("DS18B20 ERROR");
+  }
+
+  // Read vibration
+  vibrationG = readVibration();
+
+  // Send data every second
+  if (millis() - lastSend >= SEND_INTERVAL) {
+    lastSend = millis();
+
+    Serial.print("Temperature: ");
+    Serial.println(temperatureC);
+
+    Serial.print("Vibration: ");
+    Serial.println(vibrationG);
+
+    sendData();
+  }
+
+  delay(20);
+}
+[12/10, 11:07 am] +91 63853 98950: #define ENABLE_USER_AUTH
+#define ENABLE_DATABASE
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <FirebaseClient.h>
+#include <SPI.h>
+#include <LoRa.h>
+
+// -------- WIFI / FIREBASE --------
+#define WIFI_SSID     "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define API_KEY       "YOUR_FIREBASE_API_KEY"
+#define USER_EMAIL    "YOUR_FIREBASE_EMAIL"
+#define USER_PASSWORD "YOUR_FIREBASE_PASSWORD"
+
+#define DATABASE_URL "https://predictive-maintenance-motor-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+// -------- LORA PINS --------
+#define LORA_SS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+// -------- OUTPUT PINS --------
+#define GREEN_LED 32
+#define RED_LED   33
+#define BUZZER    25
+
+// -------- THRESHOLDS --------
+#define MIN_TEMP 20.0
+#define MAX_TEMP 40.0
+#define MAX_VIBRATION 0.20
+
+const unsigned long FIREBASE_INTERVAL = 5000;
+const unsigned long DATA_TIMEOUT = 5000;
+const unsigned long WIFI_RETRY_INTERVAL = 10000;
+const unsigned long LORA_RETRY_INTERVAL = 5000;
+
+unsigned long lastFirebaseWrite = 0;
+unsigned long lastDataTime = 0;
+unsigned long lastWiFiAttempt = 0;
+unsigned long lastLoRaAttempt = 0;
+
+bool loraReady = false;
+bool firebaseStarted = false;
+bool validDataAvailable = false;
+
+float temperature = NAN;
+float vibration = NAN;
+int rssi = 0;
+
+String motorStatus = "WAITING";
+bool greenLEDState = false;
+bool redLEDState = false;
+bool buzzerState = false;
+
+UserAuth user_auth(API_KEY, USER_EMAIL, USER_PASSWORD);
+FirebaseApp app;
+WiFiClientSecure ssl_client;
+using AsyncClient = AsyncClientClass;
+AsyncClient async_client(ssl_client);
+RealtimeDatabase Database;
+
+// -------- FIREBASE CALLBACK --------
+void processData(AsyncResult &result) {
+  if (!result.isResult()) return;
+
+  if (result.isError()) {
+    Serial.print("Firebase error: ");
+    Serial.println(result.error().message());
+  }
+
+  if (result.uid() == "liveWriteTask") {
+    Serial.println("Firebase write completed");
+  }
+}
+
+// -------- LED CONTROL --------
+void setOutputs(bool green, bool red, bool buzzer,
+                const char *status) {
+  greenLEDState = green;
+  redLEDState = red;
+  buzzerState = buzzer;
+  motorStatus = status;
+
+  digitalWrite(GREEN_LED, green ? HIGH : LOW);
+  digitalWrite(RED_LED, red ? HIGH : LOW);
+  digitalWrite(BUZZER, buzzer ? HIGH : LOW);
+
+  Serial.print("STATUS = ");
+  Serial.println(status);
+  Serial.println(green ? "GREEN LED = ON" : "GREEN LED = OFF");
+  Serial.println(red ? "RED LED = ON" : "RED LED = OFF");
+  Serial.println(buzzer ? "BUZZER = ON" : "BUZZER = OFF");
+}
+
+void updateNormal() {
+  setOutputs(true, false, false, "NORMAL");
+}
+
+void updateWarning() {
+  setOutputs(false, true, true, "WARNING");
+}
+
+void updateNoData() {
+  setOutputs(false, true, false, "NO DATA");
+}
+
+// -------- START LORA --------
+bool startLoRa() {
+  SPI.begin(18, 19, 23, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa initialization FAILED");
+    return false;
+  }
+
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(0x12);
+  LoRa.enableCrc();
+
+  Serial.println("LoRa = OK");
+  return true;
+}
+
+// -------- START FIREBASE --------
+void startFirebase() {
+  if (firebaseStarted || WiFi.status() != WL_CONNECTED) return;
+
+  ssl_client.setInsecure();
+  ssl_client.setConnectionTimeout(1000);
+  ssl_client.setHandshakeTimeout(5);
+
+  initializeApp(async_client, app, getAuth(user_auth),
+                processData, "authTask");
+
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+
+  firebaseStarted = true;
+  Serial.println("Firebase configuration loaded");
+}
+
+// -------- FIREBASE WRITE --------
+void writeFirebase() {
+  if (!firebaseStarted || !app.ready()) return;
+
+  if (millis() - lastFirebaseWrite < FIREBASE_INTERVAL) return;
+  if (async_client.taskCount() > 0) {
+    Serial.println("Firebase queue busy");
+    return;
+  }
+
+  String json = "{";
+  json += "\"temperature\":" + String(temperature, 2);
+  json += ",\"vibration\":" + String(vibration, 2);
+  json += ",\"rssi\":" + String(rssi);
+  json += ",\"status\":\"" + motorStatus + "\"";
+  json += ",\"greenLED\":" + String(greenLEDState ? "true" : "false");
+  json += ",\"redLED\":" + String(redLEDState ? "true" : "false");
+  json += ",\"buzzer\":" + String(buzzerState ? "true" : "false");
+  json += ",\"timestamp\":" + String(millis());
+  json += "}";
+
+  Database.set<object_t>(
+    async_client, "/live", object_t(json.c_str()),
+    processData, "liveWriteTask"
+  );
+
+  lastFirebaseWrite = millis();
+  Serial.println("Firebase WRITE QUEUED");
+}
+
+// -------- RECEIVE LORA --------
+void handleLoRa() {
+  if (!loraReady) return;
+
+  int packetSize = LoRa.parsePacket();
+  if (packetSize <= 0) return;
+
+  String data;
+  while (LoRa.available()) {
+    data += (char)LoRa.read();
+  }
+
+  rssi = LoRa.packetRssi();
+
+  Serial.print("RECEIVED: ");
+  Serial.println(data);
+  Serial.print("RSSI: ");
+  Serial.println(rssi);
+
+  int tempStart = data.indexOf("TEMP:");
+  int vibStart = data.indexOf(",VIB:");
+
+  if (tempStart < 0 || vibStart < 0) {
+    Serial.println("INVALID LORA DATA");
+    return;
+  }
+
+  String tempText = data.substring(tempStart + 5, vibStart);
+  String vibText = data.substring(vibStart + 5);
+  int statusStart = vibText.indexOf(",STATUS:");
+  if (statusStart >= 0) {
+    vibText = vibText.substring(0, statusStart);
+  }
+
+  temperature = tempText.toFloat();
+  vibration = vibText.toFloat();
+
+  // Reject sensor error or invalid readings
+  if (isnan(temperature) || isnan(vibration) ||
+      vibration < 0 || temperature < -50 || temperature > 125) {
+    validDataAvailable = false;
+    updateWarning();
+    writeFirebase();
+    return;
+  }
+
+  lastDataTime = millis();
+  validDataAvailable = true;
+
+  Serial.print("Temperature = ");
+  Serial.println(temperature, 2);
+  Serial.print("Vibration = ");
+  Serial.println(vibration, 2);
+
+  if (temperature < MIN_TEMP || temperature > MAX_TEMP ||
+      vibration > MAX_VIBRATION) {
+    updateWarning();
+  } else {
+    updateNormal();
+  }
+
+  writeFirebase();
+}
+
+// -------- SETUP --------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  updateNoData();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWiFiAttempt = millis();
+
+  loraReady = startLoRa();
+  if (!loraReady) lastLoRaAttempt = millis();
+
+  Serial.println("ESP32 RECEIVER READY");
+  Serial.println("Waiting for LoRa data...");
+}
+
+// -------- MAIN LOOP --------
+void loop() {
+  if (firebaseStarted) app.loop();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!firebaseStarted) startFirebase();
+  } else if (millis() - lastWiFiAttempt >= WIFI_RETRY_INTERVAL) {
+    lastWiFiAttempt = millis();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  if (!loraReady &&
+      millis() - lastLoRaAttempt >= LORA_RETRY_INTERVAL) {
+    lastLoRaAttempt = millis();
+    loraReady = startLoRa();
+  }
+
+  handleLoRa();
+
+  if (validDataAvailable &&
+      millis() - lastDataTime >= DATA_TIMEOUT) {
+    validDataAvailable = false;
+    updateNoData();
+    writeFirebase();
+    Serial.println("LoRa DATA TIMEOUT");
+  }
+
+  delay(2);
+}
